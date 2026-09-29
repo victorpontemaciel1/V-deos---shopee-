@@ -1,0 +1,7 @@
+streamlit>=1.38
+requests>=2.31
+openai>=1.40
+moviepy>=2.1
+Pillow>=10.1
+numpy>=1.26
+PyJWT>=2.8
