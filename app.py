@@ -687,7 +687,9 @@ def video_com_movimento(produto_jpg: bytes, duracao: float):
 def renderizar(mp3: Path, palavras, saida: Path, video: Path | None = None,
                produto: bytes | None = None) -> None:
     audio = AudioFileClip(str(mp3))
-    duracao = audio.duration + 0.4
+    # margem de segurança: a duração lida do mp3 pode ser alguns centésimos maior que o áudio real
+    duracao = max(1.0, audio.duration - 0.15)
+    audio = audio.subclipped(0, duracao)
     if video is not None:  # modo Kling (IA)
         base = VideoFileClip(str(video)).without_audio()
         base = cobrir_9x16(estender(base, duracao))
