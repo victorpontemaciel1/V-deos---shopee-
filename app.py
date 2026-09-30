@@ -111,8 +111,11 @@ class Config:
     llm_model: str
     eleven_key: str
     voice_id: str
+    kling_api_key: str
     kling_access: str
     kling_secret: str
+    kling_model: str
+    kling_api_key: str
     kling_base: str
     kling_mode: str
     kling_duration: str
@@ -335,7 +338,9 @@ def gerar_roteiro(cfg: Config, nome: str, produto_jpg: bytes, com_modelo: bool) 
 # b) Vídeo (Kling AI)
 # --------------------------------------------------------------------------
 def kling_headers(cfg: Config) -> dict:
-    agora = int(time.time())
+    if cfg.kling_api_key:  # padrão novo: uma única API Key
+        return {"Authorization": f"Bearer {cfg.kling_api_key}", "Content-Type": "application/json"}
+    agora = int(time.time())  # padrão antigo: Access Key + Secret Key
     token = jwt.encode(
         {"iss": cfg.kling_access, "exp": agora + 1800, "nbf": agora - 5},
         cfg.kling_secret,
@@ -374,7 +379,7 @@ def gerar_video(cfg: Config, produto: bytes, modelo: bytes | None, prompt: str, 
     if modelo is None:
         log("2/4 Animando o produto…")
         tid = kling_enviar(cfg, KLING_I2V_PATH, {
-            "model_name": KLING_VIDEO_MODEL,
+            "model_name": cfg.kling_model,
             "mode": cfg.kling_mode,
             "duration": cfg.kling_duration,
             "image": b64(imagem_para_9x16(produto)),
@@ -396,7 +401,7 @@ def gerar_video(cfg: Config, produto: bytes, modelo: bytes | None, prompt: str, 
             imagem = preparar_imagem(http("GET", res["images"][0]["url"]).content)
             log("2/4 Animando a imagem do try-on…")
             tid = kling_enviar(cfg, KLING_I2V_PATH, {
-                "model_name": KLING_VIDEO_MODEL,
+                "model_name": cfg.kling_model,
                 "mode": cfg.kling_mode,
                 "duration": cfg.kling_duration,
                 "image": b64(imagem),
@@ -412,7 +417,7 @@ def gerar_video(cfg: Config, produto: bytes, modelo: bytes | None, prompt: str, 
         "product's shape, colors and details identical to the reference images."
     )
     tid = kling_enviar(cfg, KLING_MULTI_PATH, {
-        "model_name": KLING_VIDEO_MODEL,
+        "model_name": cfg.kling_model,
         "image_list": [{"image": b64(modelo)}, {"image": b64(produto)}],
         "prompt": prompt_final[:2400],
         "negative_prompt": negativo,
@@ -664,22 +669,22 @@ def pedir_senha() -> None:
 
 def coletar_chaves() -> dict:
     """Usa as chaves dos Secrets; só mostra campos para o que estiver faltando."""
-    nomes = ["GEMINI_API_KEY", "OPENAI_API_KEY", "ELEVENLABS_API_KEY", "KLING_ACCESS_KEY", "KLING_SECRET_KEY"]
+    nomes = ["GEMINI_API_KEY", "OPENAI_API_KEY", "ELEVENLABS_API_KEY",
+             "KLING_API_KEY", "KLING_ACCESS_KEY", "KLING_SECRET_KEY"]
     chaves = {n: segredo(n) for n in nomes}
     sem_llm = not (chaves["GEMINI_API_KEY"] or chaves["OPENAI_API_KEY"])
-    outros = {
-        "ELEVENLABS_API_KEY": "Chave ElevenLabs",
-        "KLING_ACCESS_KEY": "Kling Access Key",
-        "KLING_SECRET_KEY": "Kling Secret Key",
-    }
+    outros = {"ELEVENLABS_API_KEY": "Chave ElevenLabs"}
     faltam = [n for n in outros if not chaves[n]]
-    if sem_llm or faltam:
+    sem_kling = not (chaves["KLING_API_KEY"] or (chaves["KLING_ACCESS_KEY"] and chaves["KLING_SECRET_KEY"]))
+    if sem_llm or faltam or sem_kling:
         with st.expander("🔑 Chaves de API (preencha uma vez)", expanded=True):
             if sem_llm:
                 chaves["GEMINI_API_KEY"] = st.text_input("Chave Gemini", type="password")
                 chaves["OPENAI_API_KEY"] = st.text_input("ou chave OpenAI", type="password")
             for n in faltam:
                 chaves[n] = st.text_input(outros[n], type="password")
+            if sem_kling:
+                chaves["KLING_API_KEY"] = st.text_input("Chave Kling (API Key)", type="password")
     return chaves
 
 
@@ -727,10 +732,10 @@ def main():
             faltando.append("um link da Shopee (ou uma foto)")
         if not (chaves["GEMINI_API_KEY"] or chaves["OPENAI_API_KEY"]):
             faltando.append("chave Gemini ou OpenAI")
-        for n, r in [("ELEVENLABS_API_KEY", "chave ElevenLabs"), ("KLING_ACCESS_KEY", "Kling Access Key"),
-                     ("KLING_SECRET_KEY", "Kling Secret Key")]:
-            if not chaves[n]:
-                faltando.append(r)
+        if not chaves["ELEVENLABS_API_KEY"]:
+            faltando.append("chave ElevenLabs")
+        if not (chaves["KLING_API_KEY"] or (chaves["KLING_ACCESS_KEY"] and chaves["KLING_SECRET_KEY"])):
+            faltando.append("chave da Kling")
         if modelo and not autorizado:
             faltando.append("confirmação de autorização da pessoa da foto")
         if faltando:
@@ -745,8 +750,10 @@ def main():
             llm_model=segredo("LLM_MODEL", "gemini-2.5-flash" if usar_gemini else "gpt-4o-mini"),
             eleven_key=chaves["ELEVENLABS_API_KEY"],
             voice_id=segredo("ELEVENLABS_VOICE_ID", DEFAULT_VOICE_ID).strip(),
+            kling_api_key=chaves["KLING_API_KEY"],
             kling_access=chaves["KLING_ACCESS_KEY"],
             kling_secret=chaves["KLING_SECRET_KEY"],
+            kling_model=segredo("KLING_MODEL", KLING_VIDEO_MODEL),
             kling_base=segredo("KLING_BASE_URL", "https://api-singapore.klingai.com").rstrip("/"),
             kling_mode=qualidade,
             kling_duration=duracao,
