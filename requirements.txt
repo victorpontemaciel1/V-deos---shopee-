@@ -5,3 +5,5 @@ moviepy>=2.1
 Pillow>=10.1
 numpy>=1.26
 PyJWT>=2.8
+edge-tts>=7.0
+gTTS>=2.5

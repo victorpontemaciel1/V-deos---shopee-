@@ -12,6 +12,7 @@ Chaves: coloque em "Secrets" (Streamlit Cloud) ou variáveis de ambiente.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hmac
 import io
@@ -38,12 +39,13 @@ from moviepy import (
     AudioFileClip,
     CompositeVideoClip,
     ImageClip,
+    VideoClip,
     VideoFileClip,
     concatenate_videoclips,
     vfx,
 )
 from openai import OpenAI
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 # --------------------------------------------------------------------------
 # Constantes (ajuste aqui se a API de algum provedor mudar)
@@ -56,6 +58,17 @@ KLING_I2V_PATH = "/v1/videos/image2video"
 KLING_TRYON_PATH = "/v1/images/kolors-virtual-try-on"
 ELEVEN_MODEL = "eleven_multilingual_v2"
 DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # troque pela voz PT-BR que preferir (segredo ELEVENLABS_VOICE_ID)
+VOZ_EDGE = "pt-BR-FranciscaNeural"  # voz grátis (Microsoft). Masculina: pt-BR-AntonioNeural
+LEGENDA_Y = 1180  # altura da legenda na tela (em pixels, de 1920)
+
+# Movimentos de câmera do modo grátis: (zoom_ini, zoom_fim, x_ini, y_ini, x_fim, y_fim)
+# x e y = posição dentro da foto do produto (0 = começo, 1 = fim)
+SHOTS = [
+    (1.00, 1.25, 0.50, 0.50, 0.50, 0.50),  # mostra inteiro e aproxima
+    (1.60, 1.60, 0.30, 0.35, 0.70, 0.40),  # detalhe, deslizando para a direita
+    (1.35, 1.75, 0.50, 0.70, 0.50, 0.55),  # aproxima da parte de baixo
+    (1.80, 1.30, 0.65, 0.30, 0.50, 0.50),  # detalhe do alto e afasta
+]
 USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0 Mobile Safari/537.36"
@@ -120,6 +133,7 @@ class Config:
     kling_mode: str
     kling_duration: str
     usar_tryon: bool
+    usar_kling: bool
 
 
 # --------------------------------------------------------------------------
@@ -450,7 +464,7 @@ def palavras_do_alinhamento(al: dict) -> list[tuple[str, float, float]]:
     return palavras
 
 
-def gerar_audio(cfg: Config, texto: str, pasta: Path):
+def gerar_audio_eleven(cfg: Config, texto: str, pasta: Path):
     url = (
         f"https://api.elevenlabs.io/v1/text-to-speech/{cfg.voice_id}/with-timestamps"
         "?output_format=mp3_44100_128"
@@ -469,6 +483,54 @@ def gerar_audio(cfg: Config, texto: str, pasta: Path):
     mp3 = pasta / "locucao.mp3"
     mp3.write_bytes(base64.b64decode(resp["audio_base64"]))
     return mp3, palavras_do_alinhamento(resp["alignment"])
+
+
+def palavras_estimadas(texto: str, duracao: float) -> list[tuple[str, float, float]]:
+    """Sem timestamps: reparte a duração do áudio entre as palavras (pausa extra após pontuação)."""
+    palavras = texto.split()
+    pesos = [len(p) + (6 if re.search(r"[.,;:!?…]$", p) else 0) for p in palavras]
+    total = sum(pesos) or 1
+    saida, t = [], 0.0
+    for palavra, peso in zip(palavras, pesos):
+        d = duracao * peso / total
+        saida.append((palavra, t, t + d))
+        t += d
+    return saida
+
+
+async def _edge_tts(texto: str, destino: str, voz: str) -> None:
+    import edge_tts
+
+    await edge_tts.Communicate(texto, voz).save(destino)
+
+
+def voz_gratis(texto: str, pasta: Path) -> Path:
+    """Locução grátis: voz neural da Microsoft (edge-tts); se falhar, voz do Google (gTTS)."""
+    mp3 = pasta / "locucao.mp3"
+    try:
+        asyncio.run(_edge_tts(texto, str(mp3), VOZ_EDGE))
+        if mp3.exists() and mp3.stat().st_size > 2000:
+            return mp3
+    except Exception:
+        pass
+    from gtts import gTTS
+
+    gTTS(texto, lang="pt", tld="com.br").save(str(mp3))
+    return mp3
+
+
+def gerar_audio(cfg: Config, texto: str, pasta: Path, log=lambda msg: None):
+    """ElevenLabs (se houver chave) com fallback para a voz grátis."""
+    if cfg.eleven_key:
+        try:
+            return gerar_audio_eleven(cfg, texto, pasta)
+        except Exception as exc:
+            log(f"3/4 ElevenLabs falhou ({str(exc)[:60]}); usando voz grátis…")
+    mp3 = voz_gratis(texto, pasta)
+    audio = AudioFileClip(str(mp3))
+    duracao = audio.duration
+    audio.close()
+    return mp3, palavras_estimadas(texto, duracao)
 
 
 # --------------------------------------------------------------------------
@@ -547,7 +609,7 @@ def clips_de_legenda(palavras: list[tuple[str, float, float]]) -> list:
                 # efeito "pop": a legenda entra levemente maior e assenta em 0,1 s
                 .resized(lambda t: 1 + 0.10 * max(0.0, 1 - t / 0.10))
                 .with_start(ini)
-                .with_position(("center", "center"))
+                .with_position(("center", LEGENDA_Y))
             )
             clips.append(clip)
     return clips
@@ -569,11 +631,65 @@ def cobrir_9x16(clip):
     return clip.cropped(x1=x, y1=y, x2=x + W, y2=y + H)
 
 
-def renderizar(video: Path, mp3: Path, palavras, saida: Path) -> None:
+def preparar_tela(produto_jpg: bytes):
+    """Tela vertical grande (1,5x) com o produto inteiro sobre fundo desfocado."""
+    tw, th = int(W * 1.5), int(H * 1.5)
+    img = Image.open(io.BytesIO(produto_jpg)).convert("RGB")
+    tela = ImageOps.fit(img, (tw, th)).filter(ImageFilter.GaussianBlur(45))
+    tela = ImageEnhance.Brightness(tela).enhance(0.7)
+    frente = ImageOps.contain(img, (int(tw * 0.94), int(th * 0.62)))
+    px, py = (tw - frente.width) // 2, (th - frente.height) // 2
+    tela.paste(frente, (px, py))
+    return tela, (px, py, frente.width, frente.height)
+
+
+def clip_movimento(tela: Image.Image, rect, shot, dur: float):
+    """Um plano de câmera (zoom e deslize suaves) sobre a tela do produto."""
+    z0, z1, fx0, fy0, fx1, fy1 = shot
+    tw, th = tela.size
+    px, py, pw, ph = rect
+
+    def caixa(z, fx, fy):
+        bw, bh = tw / z, th / z
+        cx, cy = px + pw * fx, py + ph * fy
+        x0 = min(max(cx - bw / 2, 0), tw - bw)
+        y0 = min(max(cy - bh / 2, 0), th - bh)
+        return x0, y0, bw, bh
+
+    a, b = caixa(z0, fx0, fy0), caixa(z1, fx1, fy1)
+
+    def frame(t):
+        k = min(max(t / dur, 0.0), 1.0)
+        k = k * k * (3 - 2 * k)  # começo e fim suaves
+        x0, y0, bw, bh = (a[i] + (b[i] - a[i]) * k for i in range(4))
+        recorte = tela.resize(
+            (W, H), Image.Resampling.BILINEAR,
+            box=(x0, y0, min(x0 + bw, tw), min(y0 + bh, th)),
+        )
+        return np.asarray(recorte)
+
+    return VideoClip(frame, duration=dur)
+
+
+def video_com_movimento(produto_jpg: bytes, duracao: float):
+    """Modo grátis: vários planos com movimento a partir da foto do produto."""
+    tela, rect = preparar_tela(produto_jpg)
+    n = max(3, round(duracao / 3.5))
+    d = duracao / n
+    return concatenate_videoclips(
+        [clip_movimento(tela, rect, SHOTS[i % len(SHOTS)], d) for i in range(n)]
+    )
+
+
+def renderizar(mp3: Path, palavras, saida: Path, video: Path | None = None,
+               produto: bytes | None = None) -> None:
     audio = AudioFileClip(str(mp3))
     duracao = audio.duration + 0.4
-    base = VideoFileClip(str(video)).without_audio()
-    base = cobrir_9x16(estender(base, duracao))
+    if video is not None:  # modo Kling (IA)
+        base = VideoFileClip(str(video)).without_audio()
+        base = cobrir_9x16(estender(base, duracao))
+    else:  # modo grátis: foto com movimento
+        base = video_com_movimento(produto, duracao)
     final = (
         CompositeVideoClip([base] + clips_de_legenda(palavras), size=(W, H))
         .with_audio(audio)
@@ -581,7 +697,7 @@ def renderizar(video: Path, mp3: Path, palavras, saida: Path) -> None:
     )
     final.write_videofile(
         str(saida), fps=30, codec="libx264", audio_codec="aac",
-        preset="medium", threads=2, logger=None,
+        preset="veryfast", threads=2, logger=None,
     )
     final.close()
     base.close()
@@ -615,20 +731,22 @@ def processar_produto(idx: int, item: dict, modelo_raw: bytes | None,
         produto = preparar_imagem(imagem)
         modelo = preparar_imagem(modelo_raw) if modelo_raw else None
 
-        log("1/4 Escrevendo roteiro e prompt…")
-        dados = gerar_roteiro(cfg, nome, produto, com_modelo=modelo is not None)
+        log("1/4 Escrevendo roteiro…")
+        dados = gerar_roteiro(cfg, nome, produto, com_modelo=cfg.usar_kling and modelo is not None)
 
-        url_video = gerar_video(cfg, produto, modelo, dados["prompt_video"], log)
-        clipe = pasta / "clipe.mp4"
-        clipe.write_bytes(http("GET", url_video).content)
+        clipe = None
+        if cfg.usar_kling:  # opcional e pago
+            url_video = gerar_video(cfg, produto, modelo, dados["prompt_video"], log)
+            clipe = pasta / "clipe.mp4"
+            clipe.write_bytes(http("GET", url_video).content)
 
         log("3/4 Gerando locução…")
-        mp3, palavras = gerar_audio(cfg, dados["roteiro_voz"], pasta)
+        mp3, palavras = gerar_audio(cfg, dados["roteiro_voz"], pasta, log)
 
         log("4/4 Montando vídeo final (legendas + 9:16)…")
         arquivo = f"{idx + 1:02d}-{slugify(dados['nome_produto'])}.mp4"
         saida = pasta / arquivo
-        renderizar(clipe, mp3, palavras, saida)
+        renderizar(mp3, palavras, saida, video=clipe, produto=produto)
 
         log("✅ Pronto")
         return {
@@ -668,23 +786,14 @@ def pedir_senha() -> None:
 
 
 def coletar_chaves() -> dict:
-    """Usa as chaves dos Secrets; só mostra campos para o que estiver faltando."""
+    """Usa as chaves dos Secrets. Só a do Gemini/OpenAI é obrigatória; ElevenLabs e Kling são opcionais."""
     nomes = ["GEMINI_API_KEY", "OPENAI_API_KEY", "ELEVENLABS_API_KEY",
              "KLING_API_KEY", "KLING_ACCESS_KEY", "KLING_SECRET_KEY"]
     chaves = {n: segredo(n) for n in nomes}
-    sem_llm = not (chaves["GEMINI_API_KEY"] or chaves["OPENAI_API_KEY"])
-    outros = {"ELEVENLABS_API_KEY": "Chave ElevenLabs"}
-    faltam = [n for n in outros if not chaves[n]]
-    sem_kling = not (chaves["KLING_API_KEY"] or (chaves["KLING_ACCESS_KEY"] and chaves["KLING_SECRET_KEY"]))
-    if sem_llm or faltam or sem_kling:
-        with st.expander("🔑 Chaves de API (preencha uma vez)", expanded=True):
-            if sem_llm:
-                chaves["GEMINI_API_KEY"] = st.text_input("Chave Gemini", type="password")
-                chaves["OPENAI_API_KEY"] = st.text_input("ou chave OpenAI", type="password")
-            for n in faltam:
-                chaves[n] = st.text_input(outros[n], type="password")
-            if sem_kling:
-                chaves["KLING_API_KEY"] = st.text_input("Chave Kling (API Key)", type="password")
+    if not (chaves["GEMINI_API_KEY"] or chaves["OPENAI_API_KEY"]):
+        with st.expander("🔑 Chave de IA (preencha uma vez)", expanded=True):
+            chaves["GEMINI_API_KEY"] = st.text_input("Chave Gemini (grátis)", type="password")
+            chaves["OPENAI_API_KEY"] = st.text_input("ou chave OpenAI", type="password")
     return chaves
 
 
@@ -694,6 +803,11 @@ def main():
     pedir_senha()
 
     chaves = coletar_chaves()
+    kling_ok = bool(chaves["KLING_API_KEY"] or (chaves["KLING_ACCESS_KEY"] and chaves["KLING_SECRET_KEY"]))
+    usar_kling = False
+    if kling_ok:
+        tipo = st.radio("Tipo de vídeo", ["Grátis (foto com movimento)", "IA da Kling (pago)"])
+        usar_kling = tipo.startswith("IA")
 
     st.subheader("1. Cole o link do produto")
     texto_links = st.text_area(
@@ -703,21 +817,26 @@ def main():
     with st.expander("Plano B: enviar a foto do produto (se o link não funcionar)"):
         fotos = st.file_uploader("Fotos dos produtos", type=["png", "jpg", "jpeg", "webp"],
                                  accept_multiple_files=True)
-    with st.expander("Quer uma pessoa no vídeo? (opcional)"):
-        modelo = st.file_uploader("Foto da pessoa", type=["png", "jpg", "jpeg", "webp"])
-        autorizado = st.checkbox(
-            "Tenho autorização da pessoa da foto e vou identificar o vídeo como gerado por IA "
-            "quando a plataforma exigir."
-        )
+    modelo, autorizado = None, False
+    if usar_kling:
+        with st.expander("Quer uma pessoa no vídeo? (opcional)"):
+            modelo = st.file_uploader("Foto da pessoa", type=["png", "jpg", "jpeg", "webp"])
+            autorizado = st.checkbox(
+                "Tenho autorização da pessoa da foto e vou identificar o vídeo como gerado por IA "
+                "quando a plataforma exigir."
+            )
 
     st.subheader("2. Escolha o estilo")
     formato = st.selectbox("Formato do vídeo", list(FORMATOS.keys()))
 
+    duracao, qualidade, usar_tryon = "10", "std", False
     with st.expander("Opções avançadas"):
-        duracao = st.selectbox("Duração do clipe da IA (s)", ["10", "5"])
-        qualidade = st.selectbox("Qualidade", ["std", "pro"])
         paralelo = st.slider("Vídeos ao mesmo tempo", 1, 3, 1)
-        usar_tryon = st.checkbox("Provador virtual (só com pessoa + roupa)") if formato == "PROVADOR" else False
+        if usar_kling:
+            duracao = st.selectbox("Duração do clipe da IA (s)", ["10", "5"])
+            qualidade = st.selectbox("Qualidade", ["std", "pro"])
+            if formato == "PROVADOR":
+                usar_tryon = st.checkbox("Provador virtual (só com pessoa + roupa)")
 
     st.subheader("3. Gere")
     if st.button("🚀 Gerar vídeos", type="primary", use_container_width=True):
@@ -732,10 +851,6 @@ def main():
             faltando.append("um link da Shopee (ou uma foto)")
         if not (chaves["GEMINI_API_KEY"] or chaves["OPENAI_API_KEY"]):
             faltando.append("chave Gemini ou OpenAI")
-        if not chaves["ELEVENLABS_API_KEY"]:
-            faltando.append("chave ElevenLabs")
-        if not (chaves["KLING_API_KEY"] or (chaves["KLING_ACCESS_KEY"] and chaves["KLING_SECRET_KEY"])):
-            faltando.append("chave da Kling")
         if modelo and not autorizado:
             faltando.append("confirmação de autorização da pessoa da foto")
         if faltando:
@@ -758,6 +873,7 @@ def main():
             kling_mode=qualidade,
             kling_duration=duracao,
             usar_tryon=usar_tryon,
+            usar_kling=usar_kling,
         )
 
         modelo_raw = modelo.getvalue() if modelo else None
