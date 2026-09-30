@@ -259,11 +259,14 @@ def ler_shopee(url: str) -> dict:
             nome = m.group(1).replace("-", " ").strip()
             break
 
-    titulo = re.sub(r"\s*\|\s*Shopee.*$", "", _meta(html, "og:title"))
+    titulo_bruto = _meta(html, "og:title")
+    generica = bool(re.search(r"^shopee\b|ofertas incr[ií]veis|melhores pre[cç]os", titulo_bruto, re.I))
+    titulo = "" if generica else re.sub(r"\s*\|\s*Shopee.*$", "", titulo_bruto)
     nome = titulo or nome
 
-    # 1º: imagem das tags da página
-    imagem = _baixar_imagem(_meta(html, "og:image")) if _meta(html, "og:image") else None
+    # 1º: imagem das tags da página (ignorada se for a página genérica da Shopee)
+    og_img = "" if generica else _meta(html, "og:image")
+    imagem = _baixar_imagem(og_img) if og_img else None
 
     # 2º: API pública da Shopee (costuma exigir navegador; pode falhar)
     if imagem is None and shopid and itemid:
@@ -862,7 +865,7 @@ def main():
             formato=formato,
             llm_provider="Gemini" if usar_gemini else "OpenAI",
             llm_key=chaves["GEMINI_API_KEY"] if usar_gemini else chaves["OPENAI_API_KEY"],
-            llm_model=segredo("LLM_MODEL", "gemini-2.5-flash" if usar_gemini else "gpt-4o-mini"),
+            llm_model=segredo("LLM_MODEL", "gemini-3.8-flash" if usar_gemini else "gpt-4o-mini"),
             eleven_key=chaves["ELEVENLABS_API_KEY"],
             voice_id=segredo("ELEVENLABS_VOICE_ID", DEFAULT_VOICE_ID).strip(),
             kling_api_key=chaves["KLING_API_KEY"],
